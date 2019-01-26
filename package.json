@@ -1,0 +1,8 @@
+{
+    "name": "duanxin",
+    "dependencies": {
+        "cqhttp": "^1.1.1",
+        "mongodb": "^3.0.7",
+        "soap": "^0.24.0"
+    }
+}
