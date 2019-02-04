@@ -1,8 +1,10 @@
 {
     "name": "duanxin",
     "dependencies": {
+        "bcrypt": "^3.0.3",
         "cqhttp": "^1.1.1",
-        "mongodb": "^3.0.7",
-        "soap": "^0.24.0"
+        "mysql2": "^1.6.4",
+        "soap": "^0.24.0",
+        "winston": "^3.2.1"
     }
 }

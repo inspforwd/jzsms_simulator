@@ -1,98 +1,124 @@
 'use strict';
 
 const http = require('http');
+const bcrypt = require('bcrypt');
+const mysql = require('mysql2');
 const soap = require('soap');
-const MongoClient = require('mongodb').MongoClient;
+const winston = require('winston');
 const CQHttp = require('cqhttp');
 
-const config = require('./config.js');
-
 /**
- * 公共方法
+ * 加载设置
  */
-const logger = {
-    _prefix: () => {
-        let date = new Date().toISOString();
-        return `[${date.substring(0, 10)} ${date.substring(11, 19)}]`;
-    },
-
-    _output: (level, isErr, ...message) => {
-        if (isErr) {
-            console.error(logger._prefix(), `[${level}]`, ...message);
-        } else {
-            console.log(logger._prefix(), `[${level}]`, ...message);
-        }
-    },
-
-    debug: (...message) => logger._output('DEBUG', false, ...message),
-    info: (...message) => logger._output('INFO', false, ...message),
-    warn: (...message) => logger._output('WARN', true, ...message),
-    error: (...message) => logger._output('ERROR', true, ...message),
+const config = require('./config.js');
+const ERRCODE = {
+    SUCCESS: 1,
+    NO_FEE: -1,
+    WRONG_USERPASS: -2,
+    TIMEOUT: -4,
+    OTHER_ERR: -5,
+    EMPTY_CONTENT: -6,
+    EMPTY_MOBILE: -7,
+    UNKNOWN: -9,
+    BLACKLIST: -11,
+    TOOFAST: -20,
 };
 
+/**
+ * 加载各组件
+ */
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format(info => {
+            info.level = info.level.toUpperCase();
+            return info;
+        })(),
+        winston.format.colorize(),
+        winston.format.timestamp({
+            format: 'YYYY-MM-DD HH:mm:ss'
+        }),
+        winston.format.printf(info => `${info.timestamp} <${info.level}> ${info.message}`)
+    ),
+    transports: [new winston.transports.Console()]
+});
+
+const pool = mysql.createPool({
+    host: config.db.mysql.host,
+    database: config.db.mysql.database,
+    user: config.db.mysql.user,
+    password: config.db.mysql.password,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+}).promise();
+
+const qqbot = new CQHttp({
+    apiRoot: config.bots.qq.apiUrl,
+    accessToken: config.bots.qq.token,
+    secret: config.bots.qq.secret,
+});
+
+const server = http.createServer((request, response) => {
+    response.end('404: Not Found: ' + request.url);
+});
+
+/**
+ * 并发提交问题
+ */
+const working_status = new Map();
 
 /**
  * 根据手机号获取姓名
+ * @param {*} user_id 
+ * @param {*} mobile_phone 
  */
-const getPersonName = async mobile => {
-    let db = await MongoClient.connect(config.db.url);
-    let result = '';
-    try {
-        let col = await db.db(config.db.name).collection('names');
-        let r = await col.findOne({ 'mobile_phone': mobile });
-        if (r) {
-            result = r.name;
-        }
-    } finally {
-        db.close();
+const getPersonName = async (user_id, mobile_phone) => {
+    const [ rows ] = await pool.query('SELECT name FROM contacts WHERE user_id=? AND mobile_phone=?', [user_id, mobile_phone]);
+    if (rows && rows[0]) {
+        return rows[0].name;
+    } else {
+        return '';
     }
-    return result;
 };
 
 /**
- * 获取用户信息
+ * 获取用户信息，无信息或认证失败会返回null
+ * @param {*} name 
+ * @param {*} password 
  */
-const getUserInfo = async (account, password) => {
-    let db = await MongoClient.connect(config.db.url);
-    let result = null;
-    try {
-        let col = await db.db(config.db.name).collection('users');
-        let r = await col.findOne({ 'username': account, 'password': password });
-        if (r) {
-            result = {
-                username: account,
-                name: r.name,
-                enabled: r.enabled,
-                targets: r.targets,
+const getUserInfo = async (name, password) => {
+    const [ rows ] = await pool.query('SELECT * FROM accounts WHERE name=?', [name]);
+    if (rows && rows[0]) {
+        const row = rows[0];
+        const match = await bcrypt.compare(password, row.secret);
+        if (match) {
+            const [ targets ] = await pool.query('SELECT * FROM account_targets WHERE user_id=? AND is_enabled=1', [row.id]);
+            return {
+                id: row.id,
+                name: row.name,
+                nickname: row.nickname,
+                enabled: row.is_locked === 0,
+                targets: targets,
             };
-        } else {
-            throw new Error('帐号或密码错误');
         }
-    } finally {
-        db.close();
     }
-    return result;
+    return null;
 };
 
 /**
  * 保留发送记录
+ * @param {*} param 发送内容
  */
-const insertRecord = async (account, mobile, name, content, success, remark) => {
-    let db = await MongoClient.connect(config.db.url);
-    try {
-        let col = await db.db(config.db.name).collection('message_record');
-        await col.insertOne({
-            account,
-            mobile,
-            name,
-            content,
-            time: new Date(),
-            success,
-            remark,
-        });
-    } finally {
-        db.close();
-    }
+const insertRecord = async (param) => {
+    await pool.execute('INSERT INTO sms_records (user_id, mobile_phone, name, content, send_time, is_success, remark) VALUES (?, ?, ?, ?, sysdate(), ?, ?)', [
+        param.user_id,
+        param.mobile_phone,
+        param.name,
+        param.content,
+        param.is_success,
+        param.remark,
+    ]);
 };
 
 /**
@@ -100,46 +126,40 @@ const insertRecord = async (account, mobile, name, content, success, remark) => 
  */
 let badwords = [];
 const loadBadwords = async _ => {
-    let db = null;
     try {
-        db = await MongoClient.connect(config.db.url);
-        let col = await db.db(config.db.name).collection('badwords');
-        badwords = await col.find({ enabled: true }).sort({ priority: 1 }).toArray();
+        const [ rows ] = await pool.query(`SELECT pattern, action, replace_to, user_id FROM badwords WHERE is_enabled=1`);
+        badwords = rows;
     } catch (e) {
         logger.error('更新敏感词列表时出错', e);
-    } finally {
-        if (db) {
-            try {
-                db.close();
-            } catch (e) {
-                logger.error('关闭连接时出错', e);
-            }
-        }
     }
 };
 setInterval(loadBadwords, 60 * 1000);
-loadBadwords().catch(_ => { });
+loadBadwords().then(_ => logger.info('已加载敏感词列表。')).catch(_ => {});
 
 /**
- * QQ机器人部分
+ * 发送短信
+ * @param {*} args 接口参数
  */
-const bot = new CQHttp({
-    apiRoot: config.bots.qq.apiUrl,
-    accessToken: config.bots.qq.token,
-    secret: config.bots.qq.secret,
-});
-
 const sendMessage = async args => {
     let account = args.account;
     let password = args.password;
+    let warnmsg = '';
     let user = await getUserInfo(account, password);
     if (!user) {
-        throw new Error('帐号或密码错误');
+        return ERRCODE.WRONG_USERPASS;
     }
     if (!user.enabled) {
-        throw new Error('余额不足');
+        return ERRCODE.NO_FEE;
     }
 
+    if (working_status.get(account)) {
+        // 拒绝超速提交则使用return，仅提醒的话将return注释掉
+        // return ERRCODE.TOOFAST;
+        warnmsg = '[警告：检测到超速提交]';
+    }
+    working_status.set(account, true);
+
+    // 短信拆分
     let destmobiles = args.destmobile.split('||');
     let msgtexts = args.msgText.split('||');
     for (let [i, destmobile] of destmobiles.entries()) {
@@ -147,42 +167,51 @@ const sendMessage = async args => {
         let name = null;
         let output;
         try {
-            name = await getPersonName(destmobile);
+            name = await getPersonName(user.id, destmobile);
             if (name) {
-                output = `[To] ${name} <${destmobile}>:`;
+                output = `[To] ${name} <${destmobile}>: `;
             } else {
-                output = `[To] ${destmobile}:`;
+                output = `[To] ${destmobile}: `;
             }
 
             // 检查签名
             let match = msgtext.match(/【.*?】/g);
             if (!match) {
-                msgtext = '** 错误！短信内容缺少花括号签名，不允许发送！原始内容为：\n' + msgtext;
+                warnmsg = warnmsg + '[警告：短信内容缺少签名！]';
             } else if (match.length > 1) {
-                msgtext = '** 错误！短信内容有多个花括号签名，不允许发送！原始内容为：\n' + msgtext;
+                warnmsg = warnmsg + '[警告：短信内容有多个签名！]';
             }
 
             // 处理敏感词
             let stop = false;
+            let callpolice = null;
+            const mybadwords = badwords.map(w => (w.user_id === null || w.user_id === user.id));
             for (let badword of badwords) {
-                if (badword.pattern && msgtext.match(badword.pattern)) {
+                if (msgtext.match(badword.pattern)) {
                     if (badword.action === 'ignore') {
                         stop = true;
                         break;
                     } else if (badword.action === 'replace') {
                         msgtext = msgtext.replace(new RegExp(badword.pattern, 'g'), badword.replace_to);
+                    } else if (badword.action === 'error') {
+                        callpolice = badword.replace_to;
+                        break;
                     }
                 }
             }
 
+            if (callpolice) {
+                msgtext = callpolice;
+            }
+
             if (!stop) {
-                output = `${output}\n${msgtext}`;
+                output = `${output}${warnmsg}\n${msgtext}`;
                 logger.debug(output);
 
                 for (let target of user.targets) {
                     if (target.type === 'qq') {
-                        await bot('send_group_msg', {
-                            group_id: target.id,
+                        await qqbot('send_group_msg', {
+                            group_id: target.target,
                             message: output,
                             auto_escape: true
                         });
@@ -190,14 +219,27 @@ const sendMessage = async args => {
                 }
             }
 
-            await insertRecord(account, destmobile, name, msgtext, true, '');
+            await insertRecord({
+                user_id: user.id,
+                mobile_phone: destmobile,
+                name: name,
+                content: msgtext,
+                is_success: true
+            });
         } catch (e) {
             logger.error('发送短信时出错', e);
-            await insertRecord(account, destmobile, name, msgtext, false, e.message);
+            await insertRecord({
+                user_id: user.id,
+                mobile_phone: destmobile,
+                name: name,
+                content: msgtext,
+                is_success: false,
+                remark: e.message,
+            });
         }
     }
+    return ERRCODE.SUCCESS;
 };
-
 
 /**
  * 短信接口
@@ -205,11 +247,11 @@ const sendMessage = async args => {
 const myService = {
     BusinessServiceService: {
         BusinessServicePort: {
-			/**
-			 * 用户名密码校验
-			 * @param args { account: 'xxx', password: 'xxx' }
-			 * @return 1-用户名密码正确，其他-不正确
-			 */
+            /**
+             * 用户名密码校验
+             * @param args { account: 'xxx', password: 'xxx' }
+             * @return 1-用户名密码正确，其他-不正确
+             */
             validateUser: (args, callback) => {
                 getUserInfo(args.account, args.password).then(user => {
                     if (!user) {
@@ -222,55 +264,51 @@ const myService = {
                 });
             },
 
-			/**
-			 * 发送短信
-			 * @param args { account: 'xxx', password: 'xxx', destmobile: '13012345678', msgText: '短信内容' }
-			          手机号英文分号隔开
-			 * @return 大于0表示发送成功，其他值：
-						<value>-1|余额不足</value>
-						<value>-2|帐号或密码错误</value>
-						<value>-3|连接服务商失败</value>
-						<value>-4|超时</value>
-						<value>-5|其他错误，一般为网络问题，IP受限等</value>
-						<value>-6|短信内容为空</value>
-						<value>-7|目标号码为空</value>
-						<value>-8|用户通道设置不对，需要设置三个通道</value>
-						<value>-9|捕获未知异常</value>
-						<value>-10|超过最大定时时间限制</value>
-						<value>-11|目标号码在黑名单里</value>
-						<value>-12|消息内容包含禁用词语</value>
-						<value>-13|没有权限使用该网关</value>
-						<value>-14|找不到对应的Channel ID</value>
-						<value>-17|没有提交权限，客户端帐号无法使用接口提交</value>
-						<value>-20|超速提交(一般为每秒一次提交)</value>
-						<value>-21|平台未知异常</value>
-						<value>-22|IP被封</value>
-			 */
+            /**
+             * 发送短信
+             * @param args { account: 'xxx', password: 'xxx', destmobile: '13012345678', msgText: '短信内容' }
+                      手机号英文分号隔开
+             * @return 大于0表示发送成功，其他值：
+            			<value>-1|余额不足</value>
+            			<value>-2|帐号或密码错误</value>
+            			<value>-3|连接服务商失败</value>
+            			<value>-4|超时</value>
+            			<value>-5|其他错误，一般为网络问题，IP受限等</value>
+            			<value>-6|短信内容为空</value>
+            			<value>-7|目标号码为空</value>
+            			<value>-8|用户通道设置不对，需要设置三个通道</value>
+            			<value>-9|捕获未知异常</value>
+            			<value>-10|超过最大定时时间限制</value>
+            			<value>-11|目标号码在黑名单里</value>
+            			<value>-12|消息内容包含禁用词语</value>
+            			<value>-13|没有权限使用该网关</value>
+            			<value>-14|找不到对应的Channel ID</value>
+            			<value>-17|没有提交权限，客户端帐号无法使用接口提交</value>
+            			<value>-20|超速提交(一般为每秒一次提交)</value>
+            			<value>-21|平台未知异常</value>
+            			<value>-22|IP被封</value>
+             */
             sendBatchMessage: (args, callback) => {
                 if (!args.destmobile) {
                     callback('-7');
                 } else if (!args.msgText) {
                     callback('-6');
                 } else {
-                    sendMessage(args).then(_ => {
-                        callback('1');
-                    }).catch(ex => {
-                        if (ex.message && ex.message === '帐号或密码错误') {
-                            callback('-2');
-                        } else if (ex.message && ex.message === '余额不足') {
-                            callback('-1');
-                        } else {
-                            callback('-9');
-                        }
+                    sendMessage(args).then(result => {
+                        working_status.set(args.account, false);
+                        callback(`${result}`);
+                    }).catch(_ => {
+                        working_status.set(args.account, false);
+                        callback('-9');
                     });
                 }
             },
 
-			/**
-			 * 获取用户信息
-			 * @param args { account: 'xxx', password: 'xxx' }
-			 * @return ?
-			 */
+            /**
+             * 获取用户信息
+             * @param args { account: 'xxx', password: 'xxx' }
+             * @return ?
+             */
             getUserInfo: args => {
                 return '<userinfo><remainFee>100</remainFee></userinfo>';
             },
@@ -278,35 +316,9 @@ const myService = {
     }
 };
 
-
-//http server example
-const server = http.createServer((request, response) => {
-	/*
-	let body = '';
-
-    request.on('data', function (data) {
-        body += data;
-
-        // Too much POST data, kill the connection!
-        // 1e6 === 1 * Math.pow(10, 6) === 1 * 1000000 ~~~ 1MB
-        if (body.length > 1e6) {
-            request.connection.destroy();
-        }
-    });
-
-    request.on('end', function () {
-        console.log(body);
-        console.log('============================');
-    });
-    */
-
-    response.end('404: Not Found: ' + request.url);
-    logger.debug('404 Not Found:', request.url);
-});
-
 server.listen(config.server.port, config.server.ip);
 
 const xml = require('fs').readFileSync('duanxin.wsdl', 'utf8');
 soap.listen(server, '/JianzhouSMSWSServer/services/BusinessService', myService, xml);
 
-logger.info(`Listening on http://${config.server.ip}:${config.server.port} ...`);
+logger.info(`接口已启动，URL：http://${config.server.ip}:${config.server.port}/JianzhouSMSWSServer/services/BusinessService`);
