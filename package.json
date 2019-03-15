@@ -6,5 +6,8 @@
         "mysql2": "^1.6.4",
         "soap": "^0.24.0",
         "winston": "^3.2.1"
+    },
+    "scripts": {
+        "start": "npm install && node duanxin.js"
     }
 }
