@@ -224,7 +224,8 @@ const sendMessage = async args => {
                 mobile_phone: destmobile,
                 name: name,
                 content: msgtext,
-                is_success: true
+                is_success: true,
+                remark: null,
             });
         } catch (e) {
             logger.error('发送短信时出错', e);
